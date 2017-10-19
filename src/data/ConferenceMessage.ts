@@ -19,6 +19,7 @@ export type IConfOutgoingMessage =
 export interface IConfMessageSelf {
     type: 'Self';
     Id: ConfUserID;
+    pcConfig?: RTCConfiguration;
 }
 
 // NOTE(yunsi): IConfMessageJoin is sent out when you try to join a conference room.
@@ -78,6 +79,7 @@ export interface IConfOutgoingMessageAnswer extends IConfMessageAnswer, IConfOut
 export interface IConfMessageAddPeer {
     type: 'AddPeer';
     Id: ConfUserID;
+    profile?: IConfUserProfile;
 }
 
 // NOTE(yunsi): IConMessageRemovePeer is received when someone left the conference room.
@@ -94,3 +96,8 @@ export interface IConfMessageBye {
 export type ConfRoom = string;
 
 export type ConfUserID = string;
+
+export interface IConfUserProfile {
+    avatar: string;
+    name: string;
+};

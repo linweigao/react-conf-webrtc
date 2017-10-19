@@ -17,6 +17,7 @@ import {
     SpreedMessageWelcome,
     SpreedMessageSelf,
     SpreedMessageConference,
+    SpreedUserStatus,
 } from './SpreedMessage';
 
 // NOTE(andrews): TranslateSpreedMessage delegates the work of translating the message
@@ -51,6 +52,7 @@ function translateWelcomeMessage(data: SpreedMessageWelcome, message: SpreedResp
         return {
             type: 'AddPeer',
             Id: u.Id,
+            profile: translateStatus(u.Status),
         }
     });
 }
@@ -65,9 +67,37 @@ function translateConferenceMessage(data: SpreedMessageConference, message: Spre
 }
 
 function translateSelfMessage(data: SpreedMessageSelf, message: SpreedResponse): IConfMessageSelf | undefined {
+    let pcConfig;
+    let iceServers = [] as RTCIceServer[];
+
+    // NOTE(yunsi): Stun is an empty array if Stun is not configured by spreed.
+    if (data.Stun.length > 0) {
+        iceServers.push(
+            {
+                urls: data.Stun,
+            }
+        )
+    }
+
+    // NOTE(yunsi): Turn.urls is undefined if Turn is not configured by spreed.
+    if (data.Turn.urls) {
+        iceServers.push(
+            {
+                urls: data.Turn.urls,
+                username: data.Turn.username,
+                credential: data.Turn.password,
+            }
+        )
+    }
+
+    if (iceServers.length > 0) {
+        pcConfig = { iceServers }
+    }
+
     return {
         type: 'Self',
         Id: data.Id,
+        pcConfig: pcConfig,
     }
 }
 
@@ -82,6 +112,7 @@ function translateJoinedMessage(data: SpreedMessageJoined, message: SpreedRespon
     return {
         type: 'AddPeer',
         Id: data.Id,
+        profile: translateStatus(data.Status),
     }
 }
 
@@ -119,4 +150,12 @@ function translateOfferMessage(data: SpreedMessageOffer, message: SpreedResponse
         sessionDescription: data.Offer,
         from: message.From,
     }
+}
+
+function translateStatus(Status: SpreedUserStatus | undefined) {
+    if (!Status) {
+        return
+    }
+
+    return { avatar: Status.BuddyPicture, name: Status.DisplayName };
 }

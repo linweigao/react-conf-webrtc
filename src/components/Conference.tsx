@@ -14,6 +14,7 @@ import {
     IConfMessageRemovePeer,
     IConfOutgoingMessage,
     ConfUserID,
+    IConfUserProfile,
     IDataChannelMessage,
     IDataChannelMessageSpeech,
     IDataChannelMessageAudio,
@@ -44,6 +45,7 @@ import { createAudioMonitor, AudioMonitor } from '../utils/createAudioMonitor';
 import * as MediaStreamUtil from '../utils/MediaStreamUtil';
 import { StreamRecorder } from '../utils/StreamRecorder';
 import { ChromeExtension } from '../utils/ChromeExtensionUtil';
+import { PeerConnectionManager } from '../utils/PeerConnectionManager';
 import { AudioMeter } from './controls/AudioMeter';
 import { Stream } from './controls/Stream';
 
@@ -56,6 +58,7 @@ export interface ConferenceStream {
     videoEnabled: boolean;
     isScreenSharing: boolean;
     isRecording: boolean;
+    profile: IConfUserProfile;
 }
 
 export interface IStreamsRendererProps {
@@ -91,6 +94,11 @@ export interface IConferenceProps {
     onError?: (error: ConferenceError) => void;
 }
 
+const WebCamConstraints = {
+    audio: true,
+    video: true,
+}
+
 const SDPConstraints = {
     offerToReceiveAudio: 1,
     offerToReceiveVideo: 1
@@ -107,13 +115,12 @@ export interface IConferenceState {
 
 export class Conference extends React.Component<IConferenceProps, IConferenceState> {
     private connection: ConferenceConnection;
+    private pcManager = new PeerConnectionManager();
     private localId: string | undefined;
-    private peerConnections: { [id: string]: RTCPeerConnection } = {};
-    private candidates: { [id: string]: RTCIceCandidateInit[] } = {};
-    private dataChannels: { [id: string]: RTCDataChannel } = {};
     private localCamStream: MediaStream;
     private renegotiation: { [id: string]: boolean } = {};
     private streamRecorder: StreamRecorder | undefined;
+    private pcConfig: RTCConfiguration | undefined;
 
     constructor(props: IConferenceProps) {
         super(props);
@@ -189,12 +196,7 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
     }
 
     public componentWillUnmount() {
-        if (this.state.localStream.stream) {
-            MediaStreamUtil.stopMediaStream(this.state.localStream.stream);
-        }
-        if (this.connection) {
-            this.leaveRoom();
-        }
+        this.leaveRoom();
     }
 
     // NOTE(andrews): toggleAudioEnabled allows you to control the audio tracks
@@ -364,7 +366,7 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
             })
         }
         const message = createDataChannelMessageAudio(stream.id, enabled);
-        this.broadcastDataChannelMessage(message);
+        this.pcManager.broadcastMessage(message);
     }
 
     private onVideoEnabledChange(stream: ConferenceStream, enabled: boolean) {
@@ -387,7 +389,7 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
             })
         }
         const message = createDataChannelMessageVideo(stream.id, enabled);
-        this.broadcastDataChannelMessage(message);
+        this.pcManager.broadcastMessage(message);
     }
 
     private renderStream(stream: ConferenceStream) {
@@ -418,6 +420,19 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
     }
 
     private leaveRoom() {
+        const { audioMonitor, localStream } = this.state;
+
+        if (localStream.stream) {
+            MediaStreamUtil.stopMediaStream(localStream.stream);
+        }
+
+        if (audioMonitor) {
+            audioMonitor.stop();
+        }
+
+        if (!this.connection) {
+            return
+        }
         // NOTE(yunsi): Send Bye message to spreed server.
         const message = createOutgoingMessageBye()
         this.sendMessage(message);
@@ -425,45 +440,26 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
         // NOTE(yunsi): Close the WebSocket connection to spreed server.
         this.connection.close();
 
-        // NOTE(yunsi): Close all peer connections.
-        Object.keys(this.peerConnections).forEach((id: string) => {
-            // NOTE(yunsi): This will also close all datachannels created on the peerconnection
-            this.peerConnections[id].close();
-        })
+        this.pcManager.close();
     }
 
     private getUserMedia() {
-        // NOTE(yunsi): DetectRTC.load() makes sure that all devices are captured and valid result is set for relevant properties.
         return new Promise((resolve: () => void) => {
-            DetectRTC.load(() => {
-                if (DetectRTC.isWebsiteHasWebcamPermissions === false) {
-                    this.onError(createConferenceErrorWebcamPermissions())
-                }
-                if (DetectRTC.isWebsiteHasMicrophonePermissions === false) {
-                    this.onError(createConferenceErrorMicPermissions())
-                }
-
-                const constrains = {
-                    audio: DetectRTC.isWebsiteHasMicrophonePermissions,
-                    video: DetectRTC.isWebsiteHasWebcamPermissions,
-                }
-
-                if (constrains.audio || constrains.video) {
-                    navigator.mediaDevices.getUserMedia(constrains)
-                        .then(stream => {
-                            this.localCamStream = stream;
-                            this.stopRecording();
-                            this.setLocalStream(stream, {
-                                isScreenSharing: false,
-                                isRecording: false,
-                            });
-                            resolve()
-                        })
-                        .catch(this.handleMediaException);
-                } else {
+            navigator.mediaDevices.getUserMedia(WebCamConstraints)
+                .then(stream => {
+                    this.localCamStream = stream;
+                    this.stopRecording();
+                    this.setLocalStream(stream, {
+                        isScreenSharing: false,
+                        isRecording: false,
+                    });
                     resolve()
-                }
-            })
+                })
+                .catch(err => {
+                    // NOTE(yunsi): Didn't get stream
+                    this.handleMediaException(err)
+                    resolve()
+                });
         })
     }
 
@@ -525,8 +521,8 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
         })
 
         if (oldStream !== stream) {
-            for (let peerId in this.peerConnections) {
-                let peerConnection = this.peerConnections[peerId];
+            for (let peerId in this.pcManager.peerConnections) {
+                let peerConnection = this.pcManager.getPeerConnectionById(peerId);
                 if (oldStream) {
                     peerConnection.removeStream(oldStream);
                     this.renegotiation[peerId] = true;
@@ -565,35 +561,13 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
         const audioMonitor = createAudioMonitor(this.state.localStream.stream);
         audioMonitor.on('speaking', () => {
             const message = createDataChannelMessageSpeech(true);
-            this.broadcastDataChannelMessage(message)
+            this.pcManager.broadcastMessage(message)
         })
         audioMonitor.on('stopped_speaking', () => {
             const message = createDataChannelMessageSpeech(false);
-            this.broadcastDataChannelMessage(message)
+            this.pcManager.broadcastMessage(message)
         })
         this.setState({ audioMonitor });
-    }
-
-    // NOTE(yunsi): Send the speaking message to all clients through data channels
-    private broadcastDataChannelMessage(message: IDataChannelMessage) {
-        Object.keys(this.dataChannels).forEach((id: string) => {
-            this.sendMessageToDataChannel(message, id)
-        });
-    }
-
-    private sendMessageToDataChannel(message: IDataChannelMessage, id: string) {
-        const dataChannel = this.getDataChannelById(id);
-
-        if (!dataChannel) {
-            console.log(`Data channel for id ${id} does not exist`);
-            return
-        }
-        if (dataChannel.readyState !== DataChannelReadyState.OPEN) {
-            console.log(`Data channel for id ${id} is not ready yet`);
-            return
-        }
-
-        dataChannel.send(JSON.stringify(message));
     }
 
     private handleIncomingMessage(message: IConfIncomingMessage) {
@@ -616,6 +590,9 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
     }
 
     private handleSelfMessage(message: IConfMessageSelf) {
+        if (message.pcConfig) {
+            this.pcConfig = message.pcConfig;
+        }
         this.setState({ localStream: { ...this.state.localStream, id: message.Id } });
     }
 
@@ -628,16 +605,18 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
         }
 
         if (id === this.state.localStream.id) {
+            this.updatePeerProfile(message.profile, id)
             return;
         }
 
         // NOTE(yunsi): Check if a PeerConnection is already established for the given ID.
-        if (this.getPeerConnectionById(id)) {
+        if (this.pcManager.getPeerConnectionById(id)) {
             console.log('PeerConnection is already established for the given ID: ' + id);
             return
         }
         const peerConnection = this.createPeerConnectionById(id);
         this.createRemoteStreamById(id);
+        this.updatePeerProfile(message.profile, id)
 
         // NOTE(yunsi): When two clients both recieved an AddPeer event with the other client's id,
         // they will do a compare to see who should create and send the offer and dataChannel.
@@ -657,23 +636,19 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
     }
 
     private setDataChannelMessageHandler(dataChannel: RTCDataChannel, id: string) {
-        let oldChannel = this.getDataChannelById(id);
-        if (oldChannel) {
-            // NOTE(yunsi): Ideally only one side of the RTCPeerConnection should create a data channel, but in case they
-            // both create a data channel, we will replace the old channel with the new one.
-            console.log(`Replace old dataChannel: ${oldChannel} of id: ${id} with new dataChannel: ${dataChannel}`)
-        }
+        this.pcManager.setDataChannel(dataChannel, id);
         dataChannel.onmessage = (messageEvent) => { this.handleDataChannelMessage(messageEvent, id) };
-        this.dataChannels[id] = dataChannel;
     }
 
     private createPeerConnectionById(id: string) {
-        const peerConnection = new RTCPeerConnection(this.props.peerConnectionConfig);
+        const pcConfig = this.getPcConfig();
+        const peerConnection = this.pcManager.createPeerConnectionById(id, pcConfig);
         // TODO(yunsi): Add data channel config
         peerConnection.onicecandidate = (event) => {
             this.handleIceCandidate(event, id)
         };
         peerConnection.onaddstream = (event) => {
+            console.log('peerConnection.onaddstream', event);
             this.handleRemoteStreamAdded(event, id)
         };
         peerConnection.onremovestream = (event) => {
@@ -696,13 +671,29 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
                     });
             }
         }
+        peerConnection.oniceconnectionstatechange = (event) => {
+            console.log('peerConnection.oniceconnectionstatechange', peerConnection.iceConnectionState);
+        }
+
+        peerConnection.onicegatheringstatechange = (event) => {
+            console.log('peerConnection.onicegatheringstatechange', peerConnection.iceGatheringState);
+        }
 
         if (this.state.localStream.stream) {
             peerConnection.addStream(this.state.localStream.stream);
         }
-        this.peerConnections[id] = peerConnection;
 
         return peerConnection;
+    }
+
+    private getPcConfig() {
+        if (this.props.peerConnectionConfig) {
+            return this.props.peerConnectionConfig
+        }
+        if (this.pcConfig) {
+            return this.pcConfig
+        }
+        return {}
     }
 
     private handleIceCandidate(event: RTCPeerConnectionIceEvent, id: string) {
@@ -713,7 +704,7 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
     }
 
     private setLocalAndSendMessage(sessionDescription: RTCSessionDescription, type: string, id: string) {
-        const peerConnection = this.getPeerConnectionById(id);
+        const peerConnection = this.pcManager.getPeerConnectionById(id);
         if (!peerConnection) {
             console.warn('setLocalAndSendMessage(): Missing connection Id: %s');
             return
@@ -843,23 +834,7 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
     // NOTE(yunsi): When received a RemovePeer event, conference will close that PeerConnection and remove it from the connection list.
     private handleRemovePeerMessage(message: IConfMessageRemovePeer) {
         const id = message.Id;
-        const peerConnection = this.getPeerConnectionById(id);
-        const dataChannel = this.getDataChannelById(id);
-
-        if (peerConnection) {
-            peerConnection.close();
-        } else {
-            console.warn('handleRemovePeerMessage(): Missing connection Id: %s', id);
-        }
-
-        if (dataChannel) {
-            dataChannel.close();
-        } else {
-            console.warn('handleRemovePeerMessage(): Missing data channel Id: %s', id);
-        }
-
-        delete this.peerConnections[id];
-        delete this.dataChannels[id];
+        this.pcManager.removePeerConnection(id);
         const remoteStreams = {
             ...this.state.remoteStreams
         }
@@ -871,7 +846,7 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
 
     private handleCandidateMessage(message: IConfIncomingMessageCandidate) {
         const id = message.from;
-        const peerConnection = this.getPeerConnectionById(id);
+        const peerConnection = this.pcManager.getPeerConnectionById(id);
         if (!peerConnection) {
             console.warn('handleCandidateMessage(): Missing connection Id: %s');
             return
@@ -882,11 +857,7 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
             const rtcIceCandidate = this.createRTCIceCandidate(message.candidate);
             peerConnection.addIceCandidate(rtcIceCandidate);
         } else {
-            if (this.candidates[id]) {
-                this.candidates[id].push(message.candidate);
-            } else {
-                this.candidates[id] = [message.candidate];
-            }
+            this.pcManager.addCandidate(message.candidate, id);
         }
     }
 
@@ -899,7 +870,7 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
     // NOTE(yunsi): When received an Offer event, conference will set it as RemoteDescription and create an answer to the offer.
     private handleOfferMessage(message: IConfIncomingMessageOffer) {
         const id = message.from;
-        const peerConnection = this.getPeerConnectionById(id);
+        const peerConnection = this.pcManager.getPeerConnectionById(id);
 
         if (!peerConnection) {
             console.warn('handleOfferMessage(): Missing connection Id: %s', id);
@@ -920,12 +891,16 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
                 return promise;
             })
             .then(sessionDescription => this.setLocalAndSendMessage(sessionDescription, 'Answer', id))
+            .catch(err => {
+                console.warn('setRemoteDescription,', err);
+                this.onError(createConferenceErrorSetRemoteDescription(err, id));
+            })
         // TODO(yunsi): Add error handling.
     }
 
     private handleAnswerMessage(message: IConfIncomingMessageAnswer) {
         const id = message.from;
-        const peerConnection = this.getPeerConnectionById(id);
+        const peerConnection = this.pcManager.getPeerConnectionById(id);
 
         if (!peerConnection) {
             console.warn('handleAnswerMessage(): Missing connection Id: %s', id);
@@ -937,20 +912,21 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
             .setRemoteDescription(rtcSessionDescription)
             .then(() => this.processCandidates(id))
             .catch(err => {
+                console.warn('setRemoteDescription,', err);
                 this.onError(createConferenceErrorSetRemoteDescription(err, id));
             })
     }
 
     private processCandidates(id: string) {
-        const peerConnection = this.getPeerConnectionById(id);
+        const peerConnection = this.pcManager.getPeerConnectionById(id);
         if (!peerConnection) {
             console.warn('processCandidates(): Missing connection Id: %s', id);
             return
         }
 
-        if (this.candidates[id]) {
-            while (this.candidates[id].length > 0) {
-                const candidate = this.candidates[id].shift();
+        if (this.pcManager.candidates[id]) {
+            while (this.pcManager.candidates[id].length > 0) {
+                const candidate = this.pcManager.candidates[id].shift();
                 if (candidate) {
                     const rtcIceCandidate = this.createRTCIceCandidate(candidate);
                     peerConnection.addIceCandidate(rtcIceCandidate);
@@ -959,11 +935,28 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
         }
     }
 
-    private getPeerConnectionById(id: string): RTCPeerConnection {
-        return this.peerConnections[id]
-    }
+    private updatePeerProfile(profile: IConfUserProfile | undefined, id: string) {
+        if (!profile) {
+            return;
+        }
 
-    private getDataChannelById(id: string): RTCDataChannel {
-        return this.dataChannels[id]
+        if (id === this.state.localStream.id) {
+            this.setState({
+                localStream: {
+                    ...this.state.localStream,
+                    profile,
+                }
+            })
+        } else {
+            this.setState({
+                remoteStreams: {
+                    ...this.state.remoteStreams,
+                    [id]: {
+                        ...this.state.remoteStreams[id],
+                        profile,
+                    }
+                }
+            })
+        }
     }
 }

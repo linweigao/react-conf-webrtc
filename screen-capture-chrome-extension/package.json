@@ -1,11 +1,12 @@
 {
   "name": "screen-capture-chrome-extension",
-  "version": "0.1.0",
+  "version": "0.1.6",
   "description": "Chrome extension for screen capture",
-  "main": "index.js",
+  "main": "dist/message",
+  "typings": "dist/message",
   "scripts": {
-    "build": "./node_modules/.bin/webpack",
-    "watch": "./node_modules/.bin/webpack -w"
+    "clean": "rimraf dist",
+    "build": "tsc -d && webpack"
   },
   "author": "",
   "license": "MIT",
@@ -13,6 +14,9 @@
     "type": "git",
     "url": "https://github.com/teamious/react-conf-webrtc/tree/master/screen-capture-chrome-extension"
   },
+  "files": [
+    "dist/"
+  ],
   "dependencies": {},
   "devDependencies": {
     "@types/chrome": "~0.0.47",
