@@ -671,6 +671,13 @@ export class Conference extends React.Component<IConferenceProps, IConferenceSta
                     });
             }
         }
+        peerConnection.oniceconnectionstatechange = (event) => {
+            console.log('peerConnection.oniceconnectionstatechange', peerConnection.iceConnectionState);
+        }
+
+        peerConnection.onicegatheringstatechange = (event) => {
+            console.log('peerConnection.onicegatheringstatechange', peerConnection.iceGatheringState);
+        }
 
         if (this.state.localStream.stream) {
             peerConnection.addStream(this.state.localStream.stream);

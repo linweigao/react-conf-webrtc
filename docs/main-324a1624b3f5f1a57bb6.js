@@ -557,6 +557,9 @@ var Conference = (function (_super) {
         }
     };
     Conference.prototype.handleSelfMessage = function (message) {
+        if (message.pcConfig) {
+            this.pcConfig = message.pcConfig;
+        }
         this.setState({ localStream: __assign({}, this.state.localStream, { id: message.Id }) });
     };
     // NOTE(yunsi): When received an AddPeer event, conference will create a new PeerConnection and add it to the connection list.
@@ -598,7 +601,8 @@ var Conference = (function (_super) {
     };
     Conference.prototype.createPeerConnectionById = function (id) {
         var _this = this;
-        var peerConnection = this.pcManager.createPeerConnectionById(id, this.props.peerConnectionConfig);
+        var pcConfig = this.getPcConfig();
+        var peerConnection = this.pcManager.createPeerConnectionById(id, pcConfig);
         // TODO(yunsi): Add data channel config
         peerConnection.onicecandidate = function (event) {
             _this.handleIceCandidate(event, id);
@@ -627,10 +631,25 @@ var Conference = (function (_super) {
                 });
             }
         };
+        peerConnection.oniceconnectionstatechange = function (event) {
+            console.log('peerConnection.oniceconnectionstatechange', peerConnection.iceConnectionState);
+        };
+        peerConnection.onicegatheringstatechange = function (event) {
+            console.log('peerConnection.onicegatheringstatechange', peerConnection.iceGatheringState);
+        };
         if (this.state.localStream.stream) {
             peerConnection.addStream(this.state.localStream.stream);
         }
         return peerConnection;
+    };
+    Conference.prototype.getPcConfig = function () {
+        if (this.props.peerConnectionConfig) {
+            return this.props.peerConnectionConfig;
+        }
+        if (this.pcConfig) {
+            return this.pcConfig;
+        }
+        return {};
     };
     Conference.prototype.handleIceCandidate = function (event, id) {
         if (event.candidate) {
@@ -2041,9 +2060,29 @@ function translateConferenceMessage(data, message) {
     });
 }
 function translateSelfMessage(data, message) {
+    var pcConfig;
+    var iceServers = [];
+    // NOTE(yunsi): Stun is an empty array if Stun is not configured by spreed.
+    if (data.Stun.length > 0) {
+        iceServers.push({
+            urls: data.Stun,
+        });
+    }
+    // NOTE(yunsi): Turn.urls is undefined if Turn is not configured by spreed.
+    if (data.Turn.urls) {
+        iceServers.push({
+            urls: data.Turn.urls,
+            username: data.Turn.username,
+            credential: data.Turn.password,
+        });
+    }
+    if (iceServers.length > 0) {
+        pcConfig = { iceServers: iceServers };
+    }
     return {
         type: 'Self',
         Id: data.Id,
+        pcConfig: pcConfig,
     };
 }
 function translateLeftMessage(data, message) {
@@ -2234,4 +2273,4 @@ ReactDOM.render(React.createElement(App_1.App, null), document.getElementById('r
 /***/ })
 
 },[96]);
-//# sourceMappingURL=main-c47689a54b9f5bb0188a.js.map
+//# sourceMappingURL=main-324a1624b3f5f1a57bb6.js.map
